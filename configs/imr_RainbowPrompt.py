@@ -16,6 +16,19 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--KI_iter', default=10, type=int)
     subparsers.add_argument('--self_attn_idx', default=[0,1,2,3,4,5], type=int, nargs = "*", help='the layer index of the E-Prompt')
 
+    # --- Quantum-gated relevance (QKD, CVPR 2026) ---
+    subparsers.add_argument('--gate_type', default='mean', type=str,
+                            choices=['mean', 'cosine', 'mlp', 'attention', 'quantum'],
+                            help='how sample-to-task relevance is computed; mean = original RainbowPrompt')
+    subparsers.add_argument('--fusion', default='both', type=str, choices=['none', 'infer', 'both'],
+                            help='where alpha is applied: training aggregation and/or inference routing')
+    subparsers.add_argument('--n_qubits', default=8, type=int, help='qubits in the quantum feature map')
+    subparsers.add_argument('--q_layers', default=2, type=int, help='repetitions of the variational block')
+    subparsers.add_argument('--gate_tau', default=1.0, type=float, help='softmax temperature for alpha')
+    subparsers.add_argument('--gate_hidden', default=64, type=int, help='hidden width of the mlp/attention gates')
+    subparsers.add_argument('--lam_s', default=0.0, type=float, help='weight of the entropy sparsity term')
+    subparsers.add_argument('--lam_route', default=0.0, type=float, help='weight of the auxiliary task-routing loss')
+
     # Model parameters
     subparsers.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
     subparsers.add_argument('--input-size', default=224, type=int, help='images input size')

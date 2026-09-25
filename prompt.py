@@ -6,12 +6,15 @@ from loguru import logger
 import torch.nn.functional as F
 import numpy as np
 
+from quantum_gate import RelevanceGate
+
 class RainbowPrompt(nn.Module):
     def __init__(self, length=5, embed_dim=768, embedding_key='mean', prompt_init='uniform', prompt_pool=False, 
                  prompt_key=False, pool_size=None, top_k=None, batchwise_prompt=False, prompt_key_init='uniform',
                  num_layers=1, use_prefix_tune_for_e_prompt=False, num_heads=-1, same_key_value=False, cls_rank=None, 
                  prompt_rank=None, prompt_tune_idx=None, n_tasks=None,  D1=None,relation_type=None, use_linear=None,
-                 KI_iter=None, self_attn_idx=None, D2=None):
+                 KI_iter=None, self_attn_idx=None, D2=None, gate_type='mean', n_qubits=8,
+                 q_layers=2, gate_tau=1.0, gate_hidden=64, fusion='both'):
         super().__init__()
 
         self.length = length
@@ -35,10 +38,22 @@ class RainbowPrompt(nn.Module):
         self.KI_iter = KI_iter
         self.self_attn_idx = self_attn_idx
         self.D2 = D2
+        self.gate_type = gate_type
+        self.fusion = 'none' if gate_type == 'mean' else fusion
+        # e_prompt_layer_idx need not be contiguous: map a block index to its slot
+        self.layer_pos = {l: i for i, l in enumerate(prompt_tune_idx)}
         self.register_buffer(
             'stored_rainbow_prompts',
             torch.zeros(n_tasks, len(prompt_tune_idx), length, embed_dim)
         )
+        if self.gate_type != 'mean':
+            self.gate = RelevanceGate(gate_type, embed_dim, n_qubits=n_qubits,
+                                      q_layers=q_layers, tau=gate_tau, hidden=gate_hidden)
+        if self.fusion == 'both':
+            self.register_buffer(
+                'stored_evolved',
+                torch.zeros(n_tasks, len(prompt_tune_idx), length, embed_dim)
+            )
 ###########################################################################################################################   
         if self.use_linear:
             self.query_matcher = nn.ModuleList([nn.Linear(self.embed_dim, self.D2) for _ in range(len(self.prompt_tune_idx))])
@@ -111,11 +126,13 @@ class RainbowPrompt(nn.Module):
         return conditioned_base_knowledge  
     
     def Prompt_Evolution(self, layer, attended_prev, attended_curr, d_model, d_ff, dropout=0.1):
+        pos = self.layer_pos[layer]
+
         def Attention_based_Transformation(q, k, v, d_model):
             if self.use_linear:
-                q = self.query_matcher[layer](q)  
-                k = self.key_matcher[layer](k)  
-                v = self.value_matcher[layer](v)  
+                q = self.query_matcher[pos](q)  
+                k = self.key_matcher[pos](k)  
+                v = self.value_matcher[pos](v)  
 
                 scaled_attention_logits = torch.matmul(q, k.transpose(1,2)) / torch.sqrt(torch.tensor(q.shape[-1] , dtype=torch.float32).to(q.device)) 
                 attention_weights = F.softmax(scaled_attention_logits, dim=-1)  
@@ -126,7 +143,7 @@ class RainbowPrompt(nn.Module):
                 transpose_logits = torch.matmul(q_transpose, k_transpose.transpose(1,2)) / torch.sqrt(torch.tensor(q_transpose.shape[-1] , dtype=torch.float32).to(q.device)) 
                 transpose_weights = F.softmax(transpose_logits, dim=-1) 
                 output = torch.matmul(transpose_weights, output.transpose(1,2)).transpose(1,2)  
-                output = self.dense[layer](output) 
+                output = self.dense[pos](output) 
             else:
                 scaled_attention_logits = torch.matmul(q, k.transpose(1,2)) / torch.sqrt(torch.tensor(q.shape[-1] , dtype=torch.float32).to(q.device))
                 attention_weights = F.softmax(scaled_attention_logits, dim=-1)
@@ -134,8 +151,8 @@ class RainbowPrompt(nn.Module):
             return output
 
         def Task_guided_Alignment(l_index, x, d_model, d_ff):
-            x = F.relu(self.fc1[layer](x))
-            x = self.fc2[layer](x)
+            x = F.relu(self.fc1[pos](x))
+            x = self.fc2[pos](x)
             return x
 
         def Evolving(l_index, prev, curr, d_model, d_ff, dropout):
@@ -178,7 +195,7 @@ class RainbowPrompt(nn.Module):
     
     
     
-    def forward(self, x_embed, layer, previous_mask=None, cls_features=None, task_id=None, cur_id=None, train=False, p_type=None):
+    def forward(self, x_embed, layer, previous_mask=None, cls_features=None, task_id=None, cur_id=None, train=False, p_type=None, alpha=None):
         if p_type == 'Rainbow':
             out = dict()
             self.task_id = None
@@ -206,31 +223,56 @@ class RainbowPrompt(nn.Module):
                 attended_curr_base = self.task_conditioning_step(curr_base_knowledge, key_norm) 
                 Evolved_knowledge_set = self.Prompt_Evolution(layer, attended_prev_base, attended_curr_base, self.embed_dim, self.D1)
 
-                RainbowPrompt = torch.mean(Evolved_knowledge_set, dim=0)
-                with torch.no_grad():
-                    self.stored_rainbow_prompts[self.task_id, layer].copy_(RainbowPrompt)
-                RainbowPrompt = RainbowPrompt.expand(embed_norm.shape[0], -1, -1) 
+                pos = self.layer_pos[layer]
+                n_comp = Evolved_knowledge_set.shape[0]
+                if self.fusion == 'both' and alpha is not None and n_comp > 1 and n_comp == alpha.shape[1]:
+                    # relevance-weighted aggregation in place of the uniform mean of Eq. (5)
+                    with torch.no_grad():
+                        self.stored_evolved[:n_comp, pos].copy_(Evolved_knowledge_set.detach())
+                    RainbowPrompt = torch.einsum('bt,tld->bld', alpha, Evolved_knowledge_set)
+                else:
+                    RainbowPrompt = torch.mean(Evolved_knowledge_set, dim=0)
+                    with torch.no_grad():
+                        self.stored_rainbow_prompts[self.task_id, pos].copy_(RainbowPrompt)
+                        if self.fusion == 'both':
+                            # task 0 produces a single component, so the weighted
+                            # branch never runs and stored_evolved would stay empty
+                            self.stored_evolved[self.task_id, pos].copy_(RainbowPrompt)
+                    RainbowPrompt = RainbowPrompt.expand(embed_norm.shape[0], -1, -1)
                 key_prompt = RainbowPrompt[:, :int(self.length/2),:]
                 value_prompt = RainbowPrompt[:,int(self.length/2):,:]
                 out['batched_prompt'] = [key_prompt, value_prompt]
 
             else:
                 embed_norm = self.l2_normalize(cls_features, dim=-1)
-                matching_result = []
-                for certain_task in range(cur_id+1):
-                    certain_task_key = base_key[certain_task]
-                    certain_task_key = self.l2_normalize(certain_task_key, dim=-1)
-                    sim_score = torch.matmul(certain_task_key, embed_norm.t())
-                    sim_score = torch.sum(sim_score) / embed_norm.shape[0]
-                    matching_result.append(sim_score)
+                pos = self.layer_pos[layer]
 
-                matching_result_tensor = torch.stack(matching_result)
-                max_index = torch.argmax(matching_result_tensor)
+                if self.fusion == 'none' or alpha is None:
+                    matching_result = []
+                    for certain_task in range(cur_id+1):
+                        certain_task_key = base_key[certain_task]
+                        certain_task_key = self.l2_normalize(certain_task_key, dim=-1)
+                        sim_score = torch.matmul(certain_task_key, embed_norm.t())
+                        sim_score = torch.sum(sim_score) / embed_norm.shape[0]
+                        matching_result.append(sim_score)
 
-                self.task_id = int(max_index)
+                    matching_result_tensor = torch.stack(matching_result)
+                    max_index = torch.argmax(matching_result_tensor)
 
-                stored = self.stored_rainbow_prompts[self.task_id, layer]  
-                RainbowPrompt = stored.expand(embed_norm.shape[0], -1, -1) 
+                    self.task_id = int(max_index)
+
+                    stored = self.stored_rainbow_prompts[self.task_id, pos]
+                    RainbowPrompt = stored.expand(embed_norm.shape[0], -1, -1)
+                else:
+                    # relevance-weighted fusion over the stored per-task prompts,
+                    # resolved independently for each sample instead of one hard
+                    # argmax shared by the whole batch
+                    n_seen = alpha.shape[1]
+                    if self.fusion == 'both' and layer not in self.self_attn_idx:
+                        bank = self.stored_evolved[:n_seen, pos]
+                    else:
+                        bank = self.stored_rainbow_prompts[:n_seen, pos]
+                    RainbowPrompt = torch.einsum('bt,tld->bld', alpha, bank)
 
                 k_p = RainbowPrompt[:, :int(self.length/2),:]
                 v_p = RainbowPrompt[:,int(self.length/2):,:]

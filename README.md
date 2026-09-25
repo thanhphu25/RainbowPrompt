@@ -55,6 +55,62 @@ bash run_cubs.sh
 
 ---
 
+## Quantum-gated relevance (branch `QUANT`)
+
+This branch adds an optional relevance gate between the accumulated base prompts
+and the incoming sample, ported from the QGTM module of
+*Li et al., "Quantum-Gated Task-interaction Knowledge Distillation for PTM-based
+Class-Incremental Learning", CVPR 2026*.
+
+In the original method the evolved prompts are combined by a uniform average
+(Eq. 5) and, at test time, a single task is picked by an argmax over key
+similarity. Both are replaced here by coefficients `alpha_i` that measure how
+relevant each accumulated task is to the current sample:
+
+    p_i    = |<psi(h; theta) | phi(e_i; theta)>|^2      fidelity in a 2^q Hilbert space
+    alpha  = softmax(p / tau)
+    prompt = sum_i alpha_i * evolved_prompt_i
+
+`psi` and `phi` are produced by a shallow R_y / CNOT circuit, simulated exactly
+in [`quantum_gate.py`](quantum_gate.py). The circuit only contains real-valued
+gates, so the state vector stays real and autograd flows through it without a
+QML runtime.
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--gate_type` | `mean` | `mean` (original), `cosine`, `mlp`, `attention`, `quantum` |
+| `--fusion` | `both` | `both` = weighted aggregation + routing, `infer` = routing only, `none` = original |
+| `--n_qubits` | `8` | width of the quantum feature map |
+| `--q_layers` | `2` | repetitions of the variational block, **must be >= 2** (see below) |
+| `--gate_tau` | `1.0` | softmax temperature; `0.1` is a far better starting point for 20 tasks |
+| `--gate_hidden` | `64` | hidden width of the `mlp` / `attention` gates |
+| `--lam_s` | `0.0` | weight of the entropy sparsity term |
+| `--lam_route` | `0.0` | auxiliary task-routing loss, required when `--fusion infer` |
+
+`--gate_type mean` leaves every original code path untouched, so the baseline
+stays reproducible from this branch.
+
+### Two departures from the paper
+
+* **`L_s = ||alpha||_1` (Eq. 11) has no gradient.** `alpha` is a softmax output,
+  so its L1 norm is identically 1. `--lam_s` applies the entropy of `alpha`
+  instead, which expresses the same intent and is differentiable.
+* **`q_layers = 1` makes `theta` inert.** Because `R_y(a) R_y(b) = R_y(a + b)`,
+  a single repetition lets the variational angles cancel out of the fidelity
+  exactly, leaving them with zero gradient. Only the entangling chain between
+  repetitions breaks the cancellation, hence the `>= 2` requirement.
+
+### Running
+
+```bash
+python test_quantum_gate.py     # simulator vs brute-force circuit matrix, wiring checks
+bash run_ablation_cubs.sh       # A0 baseline .. A6, one output_dir per variant
+```
+
+---
+
 ## Acknowledgement
 
 This repository is built upon the codebase of **[DualPrompt](https://github.com/JH-LEE-KR/dualprompt-pytorch)**. 

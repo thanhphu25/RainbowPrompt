@@ -1,0 +1,31 @@
+# Papers (tai lieu tham khao, khong day len remote)
+papers/
+*.pdf
+
+# Ket qua chay
+logs/
+output/
+output_*/
+*.log
+test_stats.txt
+
+# Datasets
+datasets/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+*.egg-info/
+
+# Checkpoint
+*.pth
+*.pt
+*.ckpt
+
+# Misc
+.ipynb_checkpoints/
+.DS_Store

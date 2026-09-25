@@ -65,6 +65,17 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module,
             logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
         loss = criterion(logits, target) 
         loss = loss - args.balancing* output['sim_loss']
+
+        # sparsity on the relevance vector (entropy form, see quantum_gate.py)
+        if getattr(args, 'lam_s', 0.0) > 0 and output.get('sparse_loss') is not None:
+            loss = loss + args.lam_s * output['sparse_loss']
+
+        # optional auxiliary signal so the gate is trained even when alpha is only
+        # consumed at inference time (--fusion infer)
+        if getattr(args, 'lam_route', 0.0) > 0 and output.get('alpha') is not None:
+            route_target = torch.full((input.shape[0],), task_id, dtype=torch.long, device=device)
+            loss = loss + args.lam_route * torch.nn.functional.nll_loss(
+                torch.log(output['alpha'] + 1e-8), route_target)
             
         acc1, acc5 = accuracy(logits, target, topk=(1, 5))
 

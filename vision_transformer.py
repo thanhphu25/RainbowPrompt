@@ -23,6 +23,7 @@ from timm.models.registry import register_model
 
 from prompt import RainbowPrompt
 from attention import PreT_Attention
+from quantum_gate import entropy_sparsity
 from loguru import logger
 
 _logger = logging.getLogger(__name__)
@@ -321,7 +322,8 @@ class VisionTransformer(nn.Module):
             top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,
             use_g_prompt=False, g_prompt_length=None, g_prompt_layer_idx=None, use_prefix_tune_for_g_prompt=False,
             use_e_prompt=False, e_prompt_layer_idx=None, use_prefix_tune_for_e_prompt=False, same_key_value=False, n_tasks=None, 
-            D1=None, relation_type=None, use_linear=None, warm_up=None, KI_iter=None, self_attn_idx=None, D2=None):
+            D1=None, relation_type=None, use_linear=None, warm_up=None, KI_iter=None, self_attn_idx=None, D2=None,
+            gate_type='mean', n_qubits=8, q_layers=2, gate_tau=1.0, gate_hidden=64, fusion='both'):
         """
         Args:
             img_size (int, tuple): input image size
@@ -430,7 +432,8 @@ class VisionTransformer(nn.Module):
                     prompt_key_init=prompt_key_init, num_layers=num_e_prompt, use_prefix_tune_for_e_prompt=use_prefix_tune_for_e_prompt,
                     num_heads=num_heads, same_key_value=same_key_value, prompt_tune_idx=e_prompt_layer_idx, n_tasks=n_tasks, 
                     D1=D1, relation_type=relation_type, use_linear=use_linear, KI_iter=KI_iter, self_attn_idx=self_attn_idx,
-                    D2=D2)
+                    D2=D2, gate_type=gate_type, n_qubits=n_qubits, q_layers=q_layers, gate_tau=gate_tau,
+                    gate_hidden=gate_hidden, fusion=fusion)
         
         if not (use_g_prompt or use_e_prompt):
             attn_layer = Attention
@@ -511,6 +514,10 @@ class VisionTransformer(nn.Module):
                 prompt_type = 'Unique'
         else:
             prompt_type = 'Rainbow'
+
+        alpha = None
+        sparse_loss = torch.zeros((), device=x.device)
+
         x = self.patch_embed(x)
 
         if self.cls_token is not None:
@@ -523,9 +530,23 @@ class VisionTransformer(nn.Module):
                 previous_mask = None
                 self.e_prefix_feature = {}
 
+                # base_key is shared across layers and cls_features is fixed, so the
+                # relevance coefficients are identical at every block: compute once.
+                if self.rainbow_prompt.gate_type != 'mean' and cls_features is not None:
+                    n_seen = max(learned_id, 0) + 1
+                    keys = self.rainbow_prompt.base_key[:n_seen]
+                    if train and n_seen > 1:
+                        # Only the current task's embedding is tuned. Without this the
+                        # gate back-propagates into every past base_key, which the
+                        # baseline never touches after its task ends, and the drifted
+                        # keys degrade task matching at test time.
+                        keys = torch.cat([keys[:-1].detach(), keys[-1:]], dim=0)
+                    alpha, _ = self.rainbow_prompt.gate(cls_features, keys)
+                    sparse_loss = entropy_sparsity(alpha)
+
                 for i, block in enumerate(self.blocks):
                     if i in self.e_prompt_layer_idx:
-                        res = self.rainbow_prompt(x, layer=i, previous_mask=previous_mask, cls_features=cls_features, task_id=task_id, cur_id=learned_id, train=train, p_type=prompt_type)
+                        res = self.rainbow_prompt(x, layer=i, previous_mask=previous_mask, cls_features=cls_features, task_id=task_id, cur_id=learned_id, train=train, p_type=prompt_type, alpha=alpha)
                         e_prompt = res['batched_prompt']
                         x = block(x, prompt=e_prompt)
 
@@ -537,6 +558,8 @@ class VisionTransformer(nn.Module):
                 res = dict()
         x = self.norm(x)
         res['x'] = x
+        res['alpha'] = alpha
+        res['sparse_loss'] = sparse_loss
 
         return res
 

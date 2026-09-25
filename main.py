@@ -60,6 +60,11 @@ def main(args):
     args_str = ', '.join(f'{k}={v}' for k, v in vars(args).items())
     logger.info(f'Parsed arguments: {args_str}')
     
+    if args.fusion == 'infer' and args.gate_type != 'mean' and args.lam_route <= 0:
+        raise ValueError(
+            "--fusion infer uses alpha only at test time, so the gate would never "
+            "receive a gradient. Set --lam_route > 0 (e.g. 0.1) or use --fusion both.")
+
     initialize_experiment(seed=args.seed)
     
     utils.init_distributed_mode(args)
@@ -114,7 +119,13 @@ def main(args):
         warm_up=args.warm_up,
         KI_iter=args.KI_iter,
         self_attn_idx = args.self_attn_idx,
-        D2=args.D2
+        D2=args.D2,
+        gate_type=args.gate_type,
+        n_qubits=args.n_qubits,
+        q_layers=args.q_layers,
+        gate_tau=args.gate_tau,
+        gate_hidden=args.gate_hidden,
+        fusion=args.fusion,
     )
     original_model.to(device)
     model.to(device) 
